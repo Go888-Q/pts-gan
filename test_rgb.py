@@ -1,21 +1,14 @@
-# test phase
+import argparse
+import time
+from pathlib import Path
+
+import cv2
+import numpy as np
 import torch
 from transformers import AutoModel, AutoTokenizer
 from PIL import Image
-import os
-from torch.autograd import Variable
+
 from net import Net_G
-import utils
-import numpy as np
-import torch.nn.functional as F
-import time
-import numpy as np    
-import cv2    
-import time
-import torchvision.transforms as transforms
-import matplotlib.pyplot as plt
-from PIL import Image
-from fvcore.nn import FlopCountAnalysis
 
 def params_count(model):
   """
@@ -25,63 +18,113 @@ def params_count(model):
   """
   return np.sum([p.numel() for p in model.parameters()]).item()
 
-def main():
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    bert_model_path = "bert-base-uncased"
-    bert_tokenizer = AutoTokenizer.from_pretrained(bert_model_path)
-    bert_model = AutoModel.from_pretrained(bert_model_path).to(device)
+def parse_args():
+    parser = argparse.ArgumentParser(description="Run MRI-T1/MRI-T2 fusion test with a trained PTS-GAN generator.")
+    parser.add_argument("--data-root", type=str, default="/data/wangjiaqi/fusion")
+    parser.add_argument("--mri-t1-dir", type=str, default="MRI-T1")
+    parser.add_argument("--mri-t2-dir", type=str, default="MRI-T2")
+    parser.add_argument("--pathology-text-dir", type=str, default="Pathology_Orders")
+    parser.add_argument("--ultrasound-text-dir", type=str, default="Ultrasound_Orders")
+    parser.add_argument("--shared-text-dir", type=str, default="text")
+    parser.add_argument("--model-path", type=str, default="checkpoints/net_g_latest.pth")
+    parser.add_argument("--output-dir", type=str, default="results")
+    parser.add_argument("--bert-model", type=str, default="bert-base-uncased")
+    parser.add_argument("--text-max-length", type=int, default=77)
+    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    return parser.parse_args()
+
+def main():
+    args = parse_args()
+    device = torch.device(args.device)
+    data_root = Path(args.data_root)
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    bert_tokenizer = AutoTokenizer.from_pretrained(args.bert_model)
+    bert_model = AutoModel.from_pretrained(args.bert_model).to(device)
     bert_model.eval()
 
-    test_path = ""
-
-    in_c = 2
-    out_c = 1
-    model_path = ""
     result = []
 
     with torch.no_grad():
-
-        model = load_model(model_path, in_c, out_c, device)
-        output_path = ''   
-        if os.path.exists(output_path) is False:
-            os.mkdir(output_path)
-        for i in range(250):
-
-            index = i+1
-            mri_t1_path = test_path + f'MRI-T1/{index}.png'
-            mri_t2_path = test_path + f'MRI-T2/{index}.png'
+        model = load_model(args.model_path, device)
+        pairs = find_pairs(data_root / args.mri_t1_dir, data_root / args.mri_t2_dir)
+        for index, (stem, mri_t1_path, mri_t2_path) in enumerate(pairs, start=1):
             pathology_description = read_description(
-                [test_path + f"/Pathology_Orders/{index}.txt", test_path + f"/Pathology_Orders/{index}_5.txt", test_path + f"/text/{index}_5.txt"],
+                [
+                    data_root / args.pathology_text_dir / f"{stem}.txt",
+                    data_root / args.pathology_text_dir / f"{stem}_5.txt",
+                    data_root / args.shared_text_dir / f"{stem}.txt",
+                    data_root / args.shared_text_dir / f"{stem}_5.txt",
+                ],
                 "pathology report describing tissue appearance and lesion semantics",
             )
             ultrasound_description = read_description(
-                [test_path + f"/Ultrasound_Orders/{index}.txt", test_path + f"/Ultrasound_Orders/{index}_5.txt", test_path + f"/text/{index}_5.txt"],
+                [
+                    data_root / args.ultrasound_text_dir / f"{stem}.txt",
+                    data_root / args.ultrasound_text_dir / f"{stem}_5.txt",
+                    data_root / args.shared_text_dir / f"{stem}.txt",
+                    data_root / args.shared_text_dir / f"{stem}_5.txt",
+                ],
                 "ultrasound report describing anatomical structure and diagnostic cues",
             )
      
-            elapsed_time = run_demo(device, bert_tokenizer, bert_model, model, mri_t1_path, mri_t2_path, pathology_description, ultrasound_description, output_path, index)
+            elapsed_time = run_demo(
+                device,
+                bert_tokenizer,
+                bert_model,
+                model,
+                mri_t1_path,
+                mri_t2_path,
+                pathology_description,
+                ultrasound_description,
+                output_dir,
+                stem,
+                args.text_max_length,
+            )
             result.append(elapsed_time)
         avg_time = np.mean(result)
     print("Avg Time: {:.4f}s\n".format(avg_time))
     print('Done......')
 
 
-def load_model(path, input_nc, output_nc, device):
+def find_pairs(mri_t1_dir, mri_t2_dir):
+    image_exts = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
+    if not mri_t1_dir.exists():
+        raise FileNotFoundError(f"MRI-T1 directory not found: {mri_t1_dir}")
+    if not mri_t2_dir.exists():
+        raise FileNotFoundError(f"MRI-T2 directory not found: {mri_t2_dir}")
+
+    mri_t2_by_stem = {
+        path.stem: path
+        for path in sorted(mri_t2_dir.iterdir())
+        if path.is_file() and path.suffix.lower() in image_exts
+    }
+    pairs = []
+    for mri_t1_path in sorted(mri_t1_dir.iterdir()):
+        if not mri_t1_path.is_file() or mri_t1_path.suffix.lower() not in image_exts:
+            continue
+        mri_t2_path = mri_t2_by_stem.get(mri_t1_path.stem)
+        if mri_t2_path is not None:
+            pairs.append((mri_t1_path.stem, mri_t1_path, mri_t2_path))
+
+    if not pairs:
+        raise RuntimeError(f"No paired images found in {mri_t1_dir} and {mri_t2_dir}.")
+    return pairs
+
+
+def load_model(path, device):
 
     TextFusionNet_model = Net_G()
 
-    TextFusionNet_model.load_state_dict(torch.load(path, map_location=device))
+    state = torch.load(path, map_location=device)
+    if isinstance(state, dict) and "generator" in state:
+        state = state["generator"]
+    TextFusionNet_model.load_state_dict(state)
     TextFusionNet_model.to(device)
 
     para = sum([np.prod(list(p.size())) for p in TextFusionNet_model.parameters()])
-    type_size = 4
-    x = torch.randn(1, 1, 640, 480).cuda()
-    y = torch.randn(1, 1, 640, 480).cuda()
-    z = torch.randn(1, 768).cuda()
-    flops = FlopCountAnalysis(TextFusionNet_model, (x, y, z))
-    print("FLOPs(G): %.4f" % (flops.total()/1e9))
-
     print('Model {} : params: {:4f}M'.format(TextFusionNet_model._get_name(), para / 1000/1000))
 
     TextFusionNet_model.eval()
@@ -91,8 +134,9 @@ def load_model(path, input_nc, output_nc, device):
 
 def read_description(paths, fallback):
     for path in paths:
-        if os.path.exists(path):
-            with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+        path = Path(path)
+        if path.exists():
+            with path.open('r', encoding='utf-8', errors='ignore') as f:
                 description = f.readline().strip()
                 if description:
                     return description
@@ -146,9 +190,11 @@ def ycbcr_to_rgb(y, cb, cr):
 
 
 
-def run_demo(device, bert_tokenizer, bert_model, model, mri_t1_path, mri_t2_path, pathology_description, ultrasound_description, output_path_root, index):
+def run_demo(device, bert_tokenizer, bert_model, model, mri_t1_path, mri_t2_path, pathology_description, ultrasound_description, output_path_root, stem, text_max_length):
 
-    mri_t2_img = cv2.imread(mri_t2_path, cv2.IMREAD_GRAYSCALE)
+    mri_t2_img = cv2.imread(str(mri_t2_path), cv2.IMREAD_GRAYSCALE)
+    if mri_t2_img is None:
+        raise FileNotFoundError(f"MRI-T2 image not found or unreadable: {mri_t2_path}")
     mri_t1_img = Image.open(mri_t1_path).convert("RGB")
     H, W = mri_t2_img.shape
     h, w = mri_t2_img.shape
@@ -160,8 +206,8 @@ def run_demo(device, bert_tokenizer, bert_model, model, mri_t1_path, mri_t2_path
 
     mri_t1_y, mri_t1_cb, mri_t1_cr = rgb_to_ycbcr(mri_t1_img)
     
-    pathology_text_features = encode_bert_text(bert_model, bert_tokenizer, [pathology_description], device)
-    ultrasound_text_features = encode_bert_text(bert_model, bert_tokenizer, [ultrasound_description], device)
+    pathology_text_features = encode_bert_text(bert_model, bert_tokenizer, [pathology_description], device, text_max_length)
+    ultrasound_text_features = encode_bert_text(bert_model, bert_tokenizer, [ultrasound_description], device, text_max_length)
     
     mri_t2_img = mri_t2_img / 255.0
     mri_t1_img = mri_t1_y / 255.0
@@ -176,9 +222,9 @@ def run_demo(device, bert_tokenizer, bert_model, model, mri_t1_path, mri_t2_path
     mri_t1_patches = torch.from_numpy(mri_t1_patches).float()
     
     
-    mri_t2_patches = mri_t2_patches.cuda(device)
-    mri_t1_patches = mri_t1_patches.cuda(device)
-    model = model.cuda(device)
+    mri_t2_patches = mri_t2_patches.to(device)
+    mri_t1_patches = mri_t1_patches.to(device)
+    model = model.to(device)
     st = time.time()
     output, _, _ = model(
         mri_t1=mri_t1_patches,
@@ -198,12 +244,11 @@ def run_demo(device, bert_tokenizer, bert_model, model, mri_t1_path, mri_t2_path
     fuseImage = ycbcr_to_rgb(fuseImage, mri_t1_cb, mri_t1_cr)
     fuseImage = fuseImage.resize((W,H))
     
-    file_name = f'{index}.png'
-    if os.path.exists(output_path_root) is False:
-        os.mkdir(output_path_root)
-    output_path = os.path.join(output_path_root, file_name)
+    file_name = f'{stem}.png'
+    output_path_root.mkdir(parents=True, exist_ok=True)
+    output_path = output_path_root / file_name
 
-    # fuseImage.save(output_path)
+    fuseImage.save(output_path)
 
     print(output_path)
     return elapsed_time
