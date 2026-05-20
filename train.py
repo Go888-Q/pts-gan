@@ -17,9 +17,9 @@ IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train PTS-GAN for RGB/IR image fusion.")
-    parser.add_argument("--data-root", type=str, required=True, help="Dataset root containing ir/, vis/ and optional text/.")
-    parser.add_argument("--ir-dir", type=str, default="ir", help="Infrared image subdirectory.")
-    parser.add_argument("--vis-dir", type=str, default="vis", help="Visible RGB image subdirectory.")
+    parser.add_argument("--data-root", type=str, default="/data/wangjiaqi/fusion", help="Dataset root containing paired image folders and optional text folders.")
+    parser.add_argument("--ir-dir", type=str, default="MRI-T2", help="Infrared image subdirectory.")
+    parser.add_argument("--vis-dir", type=str, default="MRI-T1", help="Visible RGB image subdirectory.")
     parser.add_argument("--text-dir", type=str, default="text", help="Shared text prompt fallback subdirectory.")
     parser.add_argument("--vis-text-dir", type=str, default="vis_text", help="Visible image text prompt subdirectory.")
     parser.add_argument("--ir-text-dir", type=str, default="ir_text", help="Infrared image text prompt subdirectory.")
