@@ -4,7 +4,7 @@ from transformers import AutoModel, AutoTokenizer
 from PIL import Image
 import os
 from torch.autograd import Variable
-from Net import  Net_G
+from net import Net_G
 import utils
 import numpy as np
 import torch.nn.functional as F

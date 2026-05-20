@@ -4,11 +4,10 @@ import pkg_resources
 from setuptools import setup, find_packages
 
 setup(
-    name="clip",
-    py_modules=["clip"],
+    name="pts-gan",
     version="1.0",
-    description="",
-    author="OpenAI",
+    description="PTS-GAN with BERT-based dual text conditioning",
+    author="Go888-Q",
     packages=find_packages(exclude=["tests*"]),
     install_requires=[
         str(r)

@@ -1,0 +1,9 @@
+torch
+torchvision
+transformers
+einops
+numpy
+pillow
+opencv-python
+matplotlib
+fvcore
