@@ -188,8 +188,10 @@ class Evaluator():
 
         # 计算QABF
         deno = np.sum(gA + gB)
+        if deno <= 1e-12:
+            return 0.0
         nume = np.sum(np.multiply(QAF, gA) + np.multiply(QBF, gB))
-        return nume / deno
+        return float(np.clip(nume / deno, 0.0, 1.0))
 
     @classmethod
     def Qabf_getArray(cls,img):
@@ -208,18 +210,21 @@ class Evaluator():
 
     @classmethod
     def Qabf_getQabf(cls,aA, gA, aF, gF):
-        L = 1
         Tg = 0.9994
         kg = -15
         Dg = 0.5
         Ta = 0.9879
         ka = -22
         Da = 0.8
-        GAF,AAF,QgAF,QaAF,QAF = np.zeros_like(aA),np.zeros_like(aA),np.zeros_like(aA),np.zeros_like(aA),np.zeros_like(aA)
-        GAF[gA>gF]=gF[gA>gF]/gA[gA>gF]
-        GAF[gA == gF] = gF[gA == gF]
-        GAF[gA <gF] = gA[gA<gF]/gF[gA<gF]
-        AAF = 1 - np.abs(aA - aF) / (math.pi / 2)
+        eps = 1e-12
+        max_g = np.maximum(gA, gF)
+        min_g = np.minimum(gA, gF)
+        GAF = np.divide(min_g, max_g + eps, out=np.zeros_like(gA), where=max_g > eps)
+
+        angle_diff = np.abs(aA - aF)
+        angle_diff = np.minimum(angle_diff, math.pi - angle_diff)
+        AAF = 1 - angle_diff / (math.pi / 2)
+        AAF = np.clip(AAF, 0.0, 1.0)
         QgAF = Tg / (1 + np.exp(kg * (GAF - Dg)))
         QaAF = Ta / (1 + np.exp(ka * (AAF - Da)))
         QAF = QgAF* QaAF
@@ -228,7 +233,7 @@ class Evaluator():
     @classmethod
     def SSIM(cls, image_F, image_A, image_B):
         cls.input_check(image_F, image_A, image_B)
-        return ssim(image_F, image_A, data_range=255) + ssim(image_F, image_B, data_range=255)
+        return (ssim(image_F, image_A, data_range=255) + ssim(image_F, image_B, data_range=255)) / 2
 
 
 def VIFF(image_F, image_A, image_B):
