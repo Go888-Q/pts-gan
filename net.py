@@ -419,12 +419,12 @@ class TextCorrespond(nn.Module):
         d = int(dim*amplify);
 
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.mlp_vis = nn.Sequential(
+        self.mlp_pathology = nn.Sequential(
             nn.Conv2d(dim, d, 1, bias=False),
             nn.ReLU(),
             nn.Conv2d(d, text_channel, 1, bias=False)
         )        
-        self.mlp_ir = nn.Sequential(
+        self.mlp_ultrasound = nn.Sequential(
             nn.Conv2d(dim, d, 1, bias=False),
             nn.ReLU(),
             nn.Conv2d(d, text_channel, 1, bias=False)
@@ -432,14 +432,14 @@ class TextCorrespond(nn.Module):
 
         self.softmax = nn.Softmax(dim=1)
 
-    def forward(self, in_vis, in_ir, text_features):
+    def forward(self, pathology_feature, ultrasound_feature, text_features):
         # in_feats: b*c*h*w, text_featurees: 1*512
-        x_vis = self.mlp_vis(in_vis);                
-        x_ir = self.mlp_ir(in_ir)
+        x_pathology = self.mlp_pathology(pathology_feature);                
+        x_ultrasound = self.mlp_ultrasound(ultrasound_feature)
 
-        text_features = text_features.view(1,text_features.shape[1],1,1).expand_as(x_ir)
+        text_features = text_features.view(1,text_features.shape[1],1,1).expand_as(x_ultrasound)
         
-        x = x_vis + text_features * x_ir
+        x = x_pathology + text_features * x_ultrasound
         return x
 
 class Dual(nn.Module):
@@ -541,54 +541,63 @@ class Dual(nn.Module):
         self.feature_fusion_2 = Fusion_Embed(embed_dim=dim*2)
         self.feature_fusion_3 = Fusion_Embed(embed_dim=dim*2*2)
 
-    def forward(self, vis, ir, text_features=None, vis_text_features=None, ir_text_features=None): 
-        if vis_text_features is None:
-            vis_text_features = text_features
-        if ir_text_features is None:
-            ir_text_features = text_features
-        if vis_text_features is None or ir_text_features is None:
-            raise ValueError("Dual text mode needs vis_text_features and ir_text_features, or a shared text_features fallback.")
+    def forward(
+        self,
+        mri_t1=None,
+        mri_t2=None,
+        text_features=None,
+        pathology_text_features=None,
+        ultrasound_text_features=None,
+    ): 
+        if pathology_text_features is None:
+            pathology_text_features = text_features
+        if ultrasound_text_features is None:
+            ultrasound_text_features = text_features
+        if mri_t1 is None or mri_t2 is None:
+            raise ValueError("Model forward needs mri_t1 and mri_t2 image tensors.")
+        if pathology_text_features is None or ultrasound_text_features is None:
+            raise ValueError("Model forward needs pathology_text_features and ultrasound_text_features, or a shared text_features fallback.")
         
-        # VIS encoder
-        inp_enc_level1 = self.patch_embed(vis) #[1, 42, 512, 640]
+        # MRI-T1 encoder
+        inp_enc_level1 = self.patch_embed(mri_t1) #[1, 42, 512, 640]
         inp_enc_level1 = self.spatial_routing_encoder_level1(inp_enc_level1) 
         out_enc_level1 = self.encoder_level1(inp_enc_level1) 
-        text_image1 = self.fuse1(out_enc_level1, vis_text_features)
+        text_image1 = self.fuse1(out_enc_level1, pathology_text_features)
 
 
         inp_enc_level2 = self.down1_2(text_image1) 
         inp_enc_level2 = self.spatial_routing_encoder_level2(inp_enc_level2) 
         out_enc_level2 = self.encoder_level2(inp_enc_level2) 
-        text_image2 = self.fuse2(out_enc_level2, vis_text_features)
+        text_image2 = self.fuse2(out_enc_level2, pathology_text_features)
 
 
         inp_enc_level3 = self.down2_3(text_image2) 
         inp_enc_level3 = self.spatial_routing_encoder_level3(inp_enc_level3) 
         out_enc_level3 = self.encoder_level3(inp_enc_level3) 
-        text_image3 = self.fuse3(out_enc_level3, vis_text_features)
+        text_image3 = self.fuse3(out_enc_level3, pathology_text_features)
 
 
         inp_enc_level4 = self.down3_4(text_image3)        
         inp_enc_level4 = self.channel_routing_latent(inp_enc_level4)
         latent = self.latent(inp_enc_level4) 
 
-        # IR encoder
-        inp_enc_level1_b = self.patch_embed_b(ir) #[1, 42, 512, 640]
+        # MRI-T2 encoder
+        inp_enc_level1_b = self.patch_embed_b(mri_t2) #[1, 42, 512, 640]
         inp_enc_level1_b = self.spatial_routing_encoder_level1_b(inp_enc_level1_b) 
         out_enc_level1_b = self.encoder_level1_b(inp_enc_level1_b) 
-        text_image1_b = self.fuse1_b(out_enc_level1_b, ir_text_features)
+        text_image1_b = self.fuse1_b(out_enc_level1_b, ultrasound_text_features)
 
 
         inp_enc_level2_b = self.down1_2_b(text_image1_b) 
         inp_enc_level2_b = self.spatial_routing_encoder_level2_b(inp_enc_level2_b) 
         out_enc_level2_b = self.encoder_level2_b(inp_enc_level2_b) 
-        text_image2_b = self.fuse2_b(out_enc_level2_b, ir_text_features)
+        text_image2_b = self.fuse2_b(out_enc_level2_b, ultrasound_text_features)
 
 
         inp_enc_level3_b = self.down2_3_b(text_image2_b) 
         inp_enc_level3_b = self.spatial_routing_encoder_level3_b(inp_enc_level3_b) 
         out_enc_level3_b = self.encoder_level3_b(inp_enc_level3_b) 
-        text_image3_b = self.fuse3_b(out_enc_level3_b, ir_text_features)
+        text_image3_b = self.fuse3_b(out_enc_level3_b, ultrasound_text_features)
 
 
         inp_enc_level4_b = self.down3_4_b(text_image3_b)        

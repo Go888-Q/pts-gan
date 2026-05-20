@@ -49,18 +49,18 @@ def main():
         for i in range(250):
 
             index = i+1
-            infrared_path = test_path + f'ir/{index}.png'
-            visible_path = test_path + f'vis/{index}.png'
-            vis_description = read_description(
-                [test_path + f"/vis_text/{index}.txt", test_path + f"/vis_text/{index}_5.txt", test_path + f"/text/{index}_5.txt"],
-                "visible light scene with texture and color details",
+            mri_t1_path = test_path + f'MRI-T1/{index}.png'
+            mri_t2_path = test_path + f'MRI-T2/{index}.png'
+            pathology_description = read_description(
+                [test_path + f"/Pathology_Orders/{index}.txt", test_path + f"/Pathology_Orders/{index}_5.txt", test_path + f"/text/{index}_5.txt"],
+                "pathology report describing tissue appearance and lesion semantics",
             )
-            ir_description = read_description(
-                [test_path + f"/ir_text/{index}.txt", test_path + f"/ir_text/{index}_5.txt", test_path + f"/text/{index}_5.txt"],
-                "infrared thermal scene with salient heat targets",
+            ultrasound_description = read_description(
+                [test_path + f"/Ultrasound_Orders/{index}.txt", test_path + f"/Ultrasound_Orders/{index}_5.txt", test_path + f"/text/{index}_5.txt"],
+                "ultrasound report describing anatomical structure and diagnostic cues",
             )
      
-            elapsed_time = run_demo(device, bert_tokenizer, bert_model, model, infrared_path, visible_path, vis_description, ir_description, output_path, index)
+            elapsed_time = run_demo(device, bert_tokenizer, bert_model, model, mri_t1_path, mri_t2_path, pathology_description, ultrasound_description, output_path, index)
             result.append(elapsed_time)
         avg_time = np.mean(result)
     print("Avg Time: {:.4f}s\n".format(avg_time))
@@ -146,47 +146,45 @@ def ycbcr_to_rgb(y, cb, cr):
 
 
 
-def run_demo(device, bert_tokenizer, bert_model, model, infrared_path, visible_path, vis_description, ir_description, output_path_root, index):
+def run_demo(device, bert_tokenizer, bert_model, model, mri_t1_path, mri_t2_path, pathology_description, ultrasound_description, output_path_root, index):
 
-    ir_img = cv2.imread(infrared_path, cv2.IMREAD_GRAYSCALE)
-    vi_img = Image.open(visible_path).convert("RGB")
-    H, W = ir_img.shape
-    h, w = ir_img.shape
+    mri_t2_img = cv2.imread(mri_t2_path, cv2.IMREAD_GRAYSCALE)
+    mri_t1_img = Image.open(mri_t1_path).convert("RGB")
+    H, W = mri_t2_img.shape
+    h, w = mri_t2_img.shape
 
-    # 调整图像尺寸为偶数
-    h, w = ir_img.shape
     new_h = (h // 16) * 16
     new_w = (w // 16) * 16
-    ir_img = cv2.resize(ir_img, (new_w, new_h))
-    vi_img = vi_img.resize((new_w, new_h))
+    mri_t2_img = cv2.resize(mri_t2_img, (new_w, new_h))
+    mri_t1_img = mri_t1_img.resize((new_w, new_h))
 
-    vi_img_y, vi_img_cb, vi_img_cr = rgb_to_ycbcr(vi_img)
+    mri_t1_y, mri_t1_cb, mri_t1_cr = rgb_to_ycbcr(mri_t1_img)
     
-    vis_description_features = encode_bert_text(bert_model, bert_tokenizer, [vis_description], device)
-    ir_description_features = encode_bert_text(bert_model, bert_tokenizer, [ir_description], device)
+    pathology_text_features = encode_bert_text(bert_model, bert_tokenizer, [pathology_description], device)
+    ultrasound_text_features = encode_bert_text(bert_model, bert_tokenizer, [ultrasound_description], device)
     
-    ir_img = ir_img / 255.0
-    vi_img = vi_img_y / 255.0
+    mri_t2_img = mri_t2_img / 255.0
+    mri_t1_img = mri_t1_y / 255.0
     
-    h = vi_img.shape[0]
-    w = vi_img.shape[1]
+    h = mri_t1_img.shape[0]
+    w = mri_t1_img.shape[1]
     
-    ir_img_patches = np.resize(ir_img, [1, 1, h, w])
-    vi_img_patches = np.resize(vi_img, [1, 1, h, w])
+    mri_t2_patches = np.resize(mri_t2_img, [1, 1, h, w])
+    mri_t1_patches = np.resize(mri_t1_img, [1, 1, h, w])
     
-    ir_img_patches = torch.from_numpy(ir_img_patches).float()
-    vi_img_patches = torch.from_numpy(vi_img_patches).float()
+    mri_t2_patches = torch.from_numpy(mri_t2_patches).float()
+    mri_t1_patches = torch.from_numpy(mri_t1_patches).float()
     
     
-    ir_img_patches = ir_img_patches.cuda(device)
-    vi_img_patches = vi_img_patches.cuda(device)
+    mri_t2_patches = mri_t2_patches.cuda(device)
+    mri_t1_patches = mri_t1_patches.cuda(device)
     model = model.cuda(device)
     st = time.time()
     output, _, _ = model(
-        vis=vi_img_patches,
-        ir=ir_img_patches,
-        vis_text_features=vis_description_features,
-        ir_text_features=ir_description_features,
+        mri_t1=mri_t1_patches,
+        mri_t2=mri_t2_patches,
+        pathology_text_features=pathology_text_features,
+        ultrasound_text_features=ultrasound_text_features,
     )
     elapsed_time = time.time() - st
     fuseImage = np.zeros((h, w))
@@ -197,7 +195,7 @@ def run_demo(device, bert_tokenizer, bert_model, model, infrared_path, visible_p
     
     fuseImage = fuseImage * 255
     
-    fuseImage = ycbcr_to_rgb(fuseImage, vi_img_cb, vi_img_cr)
+    fuseImage = ycbcr_to_rgb(fuseImage, mri_t1_cb, mri_t1_cr)
     fuseImage = fuseImage.resize((W,H))
     
     file_name = f'{index}.png'
