@@ -383,9 +383,9 @@ def main_worker(args):
         parameter.requires_grad_(False)
 
     if parallel["mode"] == "ddp":
-        generator = DDP(generator, device_ids=[device.index], output_device=device.index)
-        d_mri_t1 = DDP(d_mri_t1, device_ids=[device.index], output_device=device.index)
-        d_mri_t2 = DDP(d_mri_t2, device_ids=[device.index], output_device=device.index)
+        generator = DDP(generator, device_ids=[device.index], output_device=device.index, find_unused_parameters=True)
+        d_mri_t1 = DDP(d_mri_t1, device_ids=[device.index], output_device=device.index, find_unused_parameters=True)
+        d_mri_t2 = DDP(d_mri_t2, device_ids=[device.index], output_device=device.index, find_unused_parameters=True)
     elif parallel["mode"] == "dp":
         generator = nn.DataParallel(generator, device_ids=parallel["gpu_ids"], output_device=parallel["gpu_ids"][0])
         d_mri_t1 = nn.DataParallel(d_mri_t1, device_ids=parallel["gpu_ids"], output_device=parallel["gpu_ids"][0])
