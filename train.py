@@ -435,10 +435,10 @@ def main_worker(args):
             with torch.no_grad():
                 pathology_text_features = encode_bert_text(
                     bert_model, tokenizer, batch["pathology_text"], device, args.text_max_length
-                )
+                ).detach()
                 ultrasound_text_features = encode_bert_text(
                     bert_model, tokenizer, batch["ultrasound_text"], device, args.text_max_length
-                )
+                ).detach()
 
             with torch.no_grad():
                 with torch.cuda.amp.autocast(enabled=args.amp and device.type == "cuda"):

@@ -174,7 +174,7 @@ class ca_layer(nn.Module):
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
         self.channel = nn.Sequential(
             nn.Conv2d(channel, hidden, 1, padding=0, bias=bias),
-            nn.ReLU(inplace=True),
+            nn.ReLU(inplace=False),
             nn.Conv2d(hidden, channel, 1, padding=0, bias=bias),
             nn.Sigmoid()
         )
@@ -189,7 +189,7 @@ class CAFF(nn.Module):
         super(CAFF, self).__init__()
         self.image_proj = nn.Sequential(
             nn.Conv2d(in_ch, hidden_ch, 3, 1, 1, bias=False),
-            nn.LeakyReLU(0.2, inplace=True),
+            nn.LeakyReLU(0.2, inplace=False),
             nn.Conv2d(hidden_ch, text_ch, 3, 1, 1, bias=False)
         )
         self.text_proj = nn.Sequential(
@@ -281,7 +281,7 @@ class DEBlock(nn.Module):
     def forward(self, h, y):
         # h = F.interpolate(h, scale_factor=2)
         h = self.conv(h)
-        h_m = nn.LeakyReLU(0.2, inplace=True)(self.CAFF(h, y))
+        h_m = nn.LeakyReLU(0.2, inplace=False)(self.CAFF(h, y))
         h_m= self.conv2(h_m)
         # h_s = nn.LeakyReLU(0.2, inplace=True)(self.DCBlk(h, mask, y))
         # weights = self.fc(ti).unsqueeze(-1).unsqueeze(-1)
@@ -370,11 +370,12 @@ class D_Block(nn.Module):
         h = self.conv(x)
         if self.bn==True:
             h = self.batchnorm(h)
-        h = nn.LeakyReLU(0.2, inplace=True)(h)
+        h = nn.LeakyReLU(0.2, inplace=False)(h)
         if c.dim() > 2:
             c = c.view(c.shape[0], c.shape[1])
         if c.shape[0] != h.shape[0]:
             c = c[:1].expand(h.shape[0], -1)
+        c = c.detach()
         text_features = self.text_gate(c.float()).view(h.shape[0], h.shape[1], 1, 1)
         h_t = h * text_features
         h_t = self.out(h_t)
