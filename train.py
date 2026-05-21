@@ -32,7 +32,7 @@ def parse_args():
     parser.add_argument("--resume-d-mri-t1", type=str, default="", help="Optional MRI-T1 discriminator checkpoint.")
     parser.add_argument("--resume-d-mri-t2", type=str, default="", help="Optional MRI-T2 discriminator checkpoint.")
     parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--batch-size", type=int, default=1, help="Batch size. In DDP this is per GPU; in DataParallel this is global batch size.")
+    parser.add_argument("--batch-size", type=int, default=2, help="Batch size. In DDP this is per GPU; in DataParallel this is global batch size.")
     parser.add_argument("--patch-size", type=int, default=256, help="Random crop size, must be divisible by 16.")
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--lr-g", type=float, default=1e-4)
@@ -455,9 +455,11 @@ def main_worker(args):
                 loss_d = loss_d_mri_t1 + loss_d_mri_t2
 
             opt_d_mri_t1.zero_grad(set_to_none=True)
-            opt_d_mri_t2.zero_grad(set_to_none=True)
-            scaler.scale(loss_d).backward()
+            scaler.scale(loss_d_mri_t1).backward()
             scaler.step(opt_d_mri_t1)
+
+            opt_d_mri_t2.zero_grad(set_to_none=True)
+            scaler.scale(loss_d_mri_t2).backward()
             scaler.step(opt_d_mri_t2)
 
             with torch.cuda.amp.autocast(enabled=args.amp and device.type == "cuda"):
