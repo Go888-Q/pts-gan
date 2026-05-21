@@ -3,10 +3,13 @@ import os
 from pathlib import Path
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from PIL import Image
 from torch import nn
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset
+from torch.utils.data.distributed import DistributedSampler
 
 from transformers import AutoModel, AutoTokenizer
 from net import Net_D, Net_G
@@ -28,7 +31,7 @@ def parse_args():
     parser.add_argument("--resume-d-mri-t1", type=str, default="", help="Optional MRI-T1 discriminator checkpoint.")
     parser.add_argument("--resume-d-mri-t2", type=str, default="", help="Optional MRI-T2 discriminator checkpoint.")
     parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--batch-size", type=int, default=8, help="Training batch size. Use at least 8 when training on eight GPUs.")
+    parser.add_argument("--batch-size", type=int, default=8, help="Batch size. In DDP this is per GPU; in DataParallel this is global batch size.")
     parser.add_argument("--patch-size", type=int, default=256, help="Random crop size, must be divisible by 16.")
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--lr-g", type=float, default=1e-4)
@@ -46,7 +49,8 @@ def parse_args():
     parser.add_argument("--bert-model", type=str, default="bert-base-uncased", help="Local BERT directory or Hugging Face model name.")
     parser.add_argument("--text-max-length", type=int, default=77)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--gpu-ids", type=str, default="0,1,2,3,4,5,6,7", help="Comma-separated GPU ids for DataParallel.")
+    parser.add_argument("--parallel", type=str, default="auto", choices=["auto", "ddp", "dp", "none"], help="Parallel mode: auto uses DDP under torchrun, otherwise DataParallel when multiple GPUs are requested.")
+    parser.add_argument("--gpu-ids", type=str, default="0,1,2,3,4,5,6,7", help="Comma-separated GPU ids to use, for example 0,1,2,3,4,5,6,7.")
     parser.add_argument("--amp", action="store_true", help="Use automatic mixed precision on CUDA.")
     return parser.parse_args()
 
@@ -60,7 +64,76 @@ def parse_gpu_ids(gpu_ids):
 
 
 def unwrap_model(model):
-    return model.module if isinstance(model, nn.DataParallel) else model
+    return model.module if isinstance(model, (nn.DataParallel, DDP)) else model
+
+
+def ddp_is_active():
+    return dist.is_available() and dist.is_initialized()
+
+
+def is_main_process():
+    return not ddp_is_active() or dist.get_rank() == 0
+
+
+def setup_parallel(args):
+    requested_gpu_ids = parse_gpu_ids(args.gpu_ids) if torch.cuda.is_available() and args.device.startswith("cuda") else []
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    rank = int(os.environ.get("RANK", "0"))
+
+    use_ddp = args.parallel == "ddp" or (args.parallel == "auto" and world_size > 1)
+    use_dp = args.parallel == "dp" or (args.parallel == "auto" and world_size == 1 and len(requested_gpu_ids) > 1)
+
+    if args.parallel == "none":
+        use_ddp = False
+        use_dp = False
+
+    if use_ddp:
+        if not torch.cuda.is_available():
+            raise RuntimeError("DDP training needs CUDA GPUs.")
+        if world_size <= 1:
+            raise RuntimeError("DDP needs torchrun. Example: torchrun --nproc_per_node=8 train.py")
+        if len(requested_gpu_ids) < world_size:
+            raise ValueError(f"DDP world size is {world_size}, but --gpu-ids only has {requested_gpu_ids}.")
+        physical_gpu_id = requested_gpu_ids[local_rank]
+        torch.cuda.set_device(physical_gpu_id)
+        dist.init_process_group(backend="nccl")
+        device = torch.device(f"cuda:{physical_gpu_id}")
+        return {
+            "mode": "ddp",
+            "device": device,
+            "gpu_ids": requested_gpu_ids[:world_size],
+            "rank": rank,
+            "local_rank": local_rank,
+            "world_size": world_size,
+            "physical_gpu_id": physical_gpu_id,
+            "is_main": rank == 0,
+        }
+
+    if torch.cuda.is_available() and args.device.startswith("cuda"):
+        available_gpus = torch.cuda.device_count()
+        missing_gpus = [gpu_id for gpu_id in requested_gpu_ids if gpu_id >= available_gpus]
+        if missing_gpus:
+            raise ValueError(f"Requested GPU ids {missing_gpus}, but only {available_gpus} CUDA devices are visible.")
+        if not requested_gpu_ids:
+            requested_gpu_ids = [0]
+        torch.cuda.set_device(requested_gpu_ids[0])
+        device = torch.device(f"cuda:{requested_gpu_ids[0]}")
+    else:
+        requested_gpu_ids = []
+        device = torch.device("cpu")
+        use_dp = False
+
+    return {
+        "mode": "dp" if use_dp else "single",
+        "device": device,
+        "gpu_ids": requested_gpu_ids,
+        "rank": 0,
+        "local_rank": 0,
+        "world_size": 1,
+        "physical_gpu_id": requested_gpu_ids[0] if requested_gpu_ids else "cpu",
+        "is_main": True,
+    }
 
 
 def find_pairs(data_root, mri_t1_dir, mri_t2_dir):
@@ -243,23 +316,16 @@ def save_checkpoint(save_dir, epoch, generator, d_mri_t1, d_mri_t2, opt_g, opt_d
 
 def main():
     args = parse_args()
-    device = torch.device(args.device)
-    gpu_ids = parse_gpu_ids(args.gpu_ids) if device.type == "cuda" else []
-    if device.type == "cuda":
-        available_gpus = torch.cuda.device_count()
-        missing_gpus = [gpu_id for gpu_id in gpu_ids if gpu_id >= available_gpus]
-        if missing_gpus:
-            raise ValueError(f"Requested GPU ids {missing_gpus}, but only {available_gpus} CUDA devices are visible.")
-        if not gpu_ids:
-            gpu_ids = [0]
-        torch.cuda.set_device(gpu_ids[0])
-        device = torch.device(f"cuda:{gpu_ids[0]}")
+    parallel = setup_parallel(args)
+    device = parallel["device"]
 
     dataset = FusionDataset(args)
+    sampler = DistributedSampler(dataset, shuffle=True) if parallel["mode"] == "ddp" else None
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=sampler is None,
+        sampler=sampler,
         num_workers=args.num_workers,
         pin_memory=device.type == "cuda",
     )
@@ -277,11 +343,43 @@ def main():
     for parameter in bert_model.parameters():
         parameter.requires_grad_(False)
 
-    if device.type == "cuda" and len(gpu_ids) > 1:
-        generator = nn.DataParallel(generator, device_ids=gpu_ids, output_device=gpu_ids[0])
-        d_mri_t1 = nn.DataParallel(d_mri_t1, device_ids=gpu_ids, output_device=gpu_ids[0])
-        d_mri_t2 = nn.DataParallel(d_mri_t2, device_ids=gpu_ids, output_device=gpu_ids[0])
-        print(f"Using DataParallel on GPUs: {gpu_ids}")
+    if parallel["mode"] == "ddp":
+        generator = DDP(generator, device_ids=[device.index], output_device=device.index)
+        d_mri_t1 = DDP(d_mri_t1, device_ids=[device.index], output_device=device.index)
+        d_mri_t2 = DDP(d_mri_t2, device_ids=[device.index], output_device=device.index)
+    elif parallel["mode"] == "dp":
+        generator = nn.DataParallel(generator, device_ids=parallel["gpu_ids"], output_device=parallel["gpu_ids"][0])
+        d_mri_t1 = nn.DataParallel(d_mri_t1, device_ids=parallel["gpu_ids"], output_device=parallel["gpu_ids"][0])
+        d_mri_t2 = nn.DataParallel(d_mri_t2, device_ids=parallel["gpu_ids"], output_device=parallel["gpu_ids"][0])
+
+    if parallel["mode"] == "ddp":
+        active_gpu_count = parallel["world_size"]
+        batch_description = f"{args.batch_size} per GPU"
+        global_batch_size = args.batch_size * parallel["world_size"]
+    elif parallel["mode"] == "dp":
+        active_gpu_count = len(parallel["gpu_ids"])
+        batch_description = f"{args.batch_size} global, split across {active_gpu_count} GPUs"
+        global_batch_size = args.batch_size
+    elif device.type == "cuda":
+        active_gpu_count = 1
+        batch_description = f"{args.batch_size} on GPU {parallel['physical_gpu_id']}"
+        global_batch_size = args.batch_size
+    else:
+        active_gpu_count = 0
+        batch_description = f"{args.batch_size} on CPU"
+        global_batch_size = args.batch_size
+
+    if parallel["is_main"]:
+        print("Training parallel configuration:")
+        print(f"  mode: {parallel['mode']}")
+        print(f"  requested gpu ids: {parallel['gpu_ids'] if parallel['gpu_ids'] else 'cpu'}")
+        print(f"  active GPU count: {active_gpu_count}")
+        print(f"  DDP world size: {parallel['world_size']}")
+        print(f"  rank/local_rank/current GPU: {parallel['rank']}/{parallel['local_rank']}/{parallel['physical_gpu_id']}")
+        print(f"  batch size: {batch_description}")
+        print(f"  global batch size: {global_batch_size}")
+        print(f"  dataset pairs: {len(dataset)}")
+        print(f"  steps per epoch on this process: {len(loader)}")
 
     opt_g = torch.optim.Adam(generator.parameters(), lr=args.lr_g, betas=(args.beta1, args.beta2))
     opt_d_mri_t1 = torch.optim.Adam(d_mri_t1.parameters(), lr=args.lr_d, betas=(args.beta1, args.beta2))
@@ -290,6 +388,8 @@ def main():
     scaler = torch.cuda.amp.GradScaler(enabled=args.amp and device.type == "cuda")
 
     for epoch in range(1, args.epochs + 1):
+        if sampler is not None:
+            sampler.set_epoch(epoch)
         generator.train()
         d_mri_t1.train()
         d_mri_t2.train()
@@ -350,7 +450,7 @@ def main():
             scaler.step(opt_g)
             scaler.update()
 
-            if step % args.log_every == 0 or step == 1:
+            if parallel["is_main"] and (step % args.log_every == 0 or step == 1):
                 print(
                     f"epoch {epoch:03d}/{args.epochs:03d} "
                     f"step {step:04d}/{len(loader):04d} "
@@ -358,8 +458,11 @@ def main():
                     f"adv {loss_adv.item():.4f} int {loss_intensity.item():.4f} grad {loss_gradient.item():.4f}"
                 )
 
-        if epoch % args.save_every == 0 or epoch == args.epochs:
+        if parallel["is_main"] and (epoch % args.save_every == 0 or epoch == args.epochs):
             save_checkpoint(args.save_dir, epoch, generator, d_mri_t1, d_mri_t2, opt_g, opt_d_mri_t1, opt_d_mri_t2)
+
+    if ddp_is_active():
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

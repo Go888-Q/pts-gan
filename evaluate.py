@@ -233,7 +233,7 @@ class Evaluator():
     @classmethod
     def SSIM(cls, image_F, image_A, image_B):
         cls.input_check(image_F, image_A, image_B)
-        return (ssim(image_F, image_A, data_range=255) + ssim(image_F, image_B, data_range=255)) / 2
+        return ssim(image_F, image_A, data_range=255) + ssim(image_F, image_B, data_range=255)
 
 
 def VIFF(image_F, image_A, image_B):
