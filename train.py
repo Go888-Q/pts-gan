@@ -5,6 +5,7 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+import torch.multiprocessing as mp
 from PIL import Image
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -31,7 +32,7 @@ def parse_args():
     parser.add_argument("--resume-d-mri-t1", type=str, default="", help="Optional MRI-T1 discriminator checkpoint.")
     parser.add_argument("--resume-d-mri-t2", type=str, default="", help="Optional MRI-T2 discriminator checkpoint.")
     parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--batch-size", type=int, default=8, help="Batch size. In DDP this is per GPU; in DataParallel this is global batch size.")
+    parser.add_argument("--batch-size", type=int, default=1, help="Batch size. In DDP this is per GPU; in DataParallel this is global batch size.")
     parser.add_argument("--patch-size", type=int, default=256, help="Random crop size, must be divisible by 16.")
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--lr-g", type=float, default=1e-4)
@@ -41,7 +42,7 @@ def parse_args():
     parser.add_argument("--lambda-intensity", type=float, default=20.0)
     parser.add_argument("--lambda-gradient", type=float, default=10.0)
     parser.add_argument("--lambda-adv", type=float, default=1.0)
-    parser.add_argument("--save-every", type=int, default=5)
+    parser.add_argument("--save-every", type=int, default=1)
     parser.add_argument("--log-every", type=int, default=20)
     parser.add_argument("--default-text", type=str, default="MRI fusion medical imaging study")
     parser.add_argument("--default-pathology-text", type=str, default="pathology report describing tissue appearance and lesion semantics")
@@ -49,8 +50,10 @@ def parse_args():
     parser.add_argument("--bert-model", type=str, default="bert-base-uncased", help="Local BERT directory or Hugging Face model name.")
     parser.add_argument("--text-max-length", type=int, default=77)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--parallel", type=str, default="auto", choices=["auto", "ddp", "dp", "none"], help="Parallel mode: auto uses DDP under torchrun, otherwise DataParallel when multiple GPUs are requested.")
-    parser.add_argument("--gpu-ids", type=str, default="0,1,2,3,4,5,6,7", help="Comma-separated GPU ids to use, for example 0,1,2,3,4,5,6,7.")
+    parser.add_argument("--parallel", type=str, default="ddp", choices=["auto", "ddp", "dp", "none"], help="Parallel mode. Default ddp uses DistributedDataParallel for multi-GPU training.")
+    parser.add_argument("--gpu-ids", type=str, default="1,4,5,6,7", help="Comma-separated GPU ids to use, for example 1,4,5,6,7.")
+    parser.add_argument("--master-addr", type=str, default="127.0.0.1", help="DDP master address when launching with python train.py.")
+    parser.add_argument("--master-port", type=str, default="29500", help="DDP master port when launching with python train.py.")
     parser.add_argument("--amp", action="store_true", help="Use automatic mixed precision on CUDA.")
     return parser.parse_args()
 
@@ -75,6 +78,26 @@ def is_main_process():
     return not ddp_is_active() or dist.get_rank() == 0
 
 
+def should_spawn_ddp(args):
+    if "WORLD_SIZE" in os.environ:
+        return False
+    if not torch.cuda.is_available() or not args.device.startswith("cuda"):
+        return False
+    gpu_ids = parse_gpu_ids(args.gpu_ids)
+    return args.parallel in {"auto", "ddp"} and len(gpu_ids) > 1
+
+
+def ddp_spawn_worker(local_rank, args, gpu_ids):
+    os.environ["MASTER_ADDR"] = args.master_addr
+    os.environ["MASTER_PORT"] = args.master_port
+    os.environ["WORLD_SIZE"] = str(len(gpu_ids))
+    os.environ["RANK"] = str(local_rank)
+    os.environ["LOCAL_RANK"] = str(local_rank)
+    args.gpu_ids = ",".join(str(gpu_id) for gpu_id in gpu_ids)
+    args.parallel = "ddp"
+    main_worker(args)
+
+
 def setup_parallel(args):
     requested_gpu_ids = parse_gpu_ids(args.gpu_ids) if torch.cuda.is_available() and args.device.startswith("cuda") else []
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -92,7 +115,20 @@ def setup_parallel(args):
         if not torch.cuda.is_available():
             raise RuntimeError("DDP training needs CUDA GPUs.")
         if world_size <= 1:
-            raise RuntimeError("DDP needs torchrun. Example: torchrun --nproc_per_node=8 train.py")
+            if requested_gpu_ids:
+                torch.cuda.set_device(requested_gpu_ids[0])
+                device = torch.device(f"cuda:{requested_gpu_ids[0]}")
+                return {
+                    "mode": "single",
+                    "device": device,
+                    "gpu_ids": requested_gpu_ids[:1],
+                    "rank": 0,
+                    "local_rank": 0,
+                    "world_size": 1,
+                    "physical_gpu_id": requested_gpu_ids[0],
+                    "is_main": True,
+                }
+            raise RuntimeError("DDP training needs at least one CUDA GPU.")
         if len(requested_gpu_ids) < world_size:
             raise ValueError(f"DDP world size is {world_size}, but --gpu-ids only has {requested_gpu_ids}.")
         physical_gpu_id = requested_gpu_ids[local_rank]
@@ -314,8 +350,7 @@ def save_checkpoint(save_dir, epoch, generator, d_mri_t1, d_mri_t2, opt_g, opt_d
     torch.save(unwrap_model(generator).state_dict(), Path(save_dir) / "net_g_latest.pth")
 
 
-def main():
-    args = parse_args()
+def main_worker(args):
     parallel = setup_parallel(args)
     device = parallel["device"]
 
@@ -463,6 +498,20 @@ def main():
 
     if ddp_is_active():
         dist.destroy_process_group()
+
+
+def main():
+    args = parse_args()
+    if should_spawn_ddp(args):
+        gpu_ids = parse_gpu_ids(args.gpu_ids)
+        print("Launching DDP with python train.py:")
+        print(f"  GPU ids: {gpu_ids}")
+        print(f"  number of processes: {len(gpu_ids)}")
+        print(f"  per-GPU batch size: {args.batch_size}")
+        print(f"  global batch size: {args.batch_size * len(gpu_ids)}")
+        mp.spawn(ddp_spawn_worker, args=(args, gpu_ids), nprocs=len(gpu_ids), join=True)
+        return
+    main_worker(args)
 
 
 if __name__ == "__main__":
