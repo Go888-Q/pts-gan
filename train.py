@@ -274,8 +274,12 @@ def discriminator_loss(discriminator, real_source, fake_outputs, text_features, 
     real_2 = downsample_like(real_source, fake_2)
     real_3 = downsample_like(real_source, fake_3)
 
-    pred_real = discriminator(real_1, real_2, real_3, text_features)
-    pred_fake = discriminator(fake_1, fake_2, fake_3, text_features)
+    inputs_1 = torch.cat([real_1, fake_1], dim=0)
+    inputs_2 = torch.cat([real_2, fake_2], dim=0)
+    inputs_3 = torch.cat([real_3, fake_3], dim=0)
+    text_batch = torch.cat([text_features, text_features], dim=0)
+
+    pred_real, pred_fake = discriminator(inputs_1, inputs_2, inputs_3, text_batch).chunk(2, dim=0)
     loss_real = criterion(pred_real, torch.ones_like(pred_real))
     loss_fake = criterion(pred_fake, torch.zeros_like(pred_fake))
     return 0.5 * (loss_real + loss_fake)
